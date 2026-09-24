@@ -18,7 +18,7 @@ from contextlib import redirect_stdout
 bl_info = {
     "name": "Blender MCP",
     "author": "BlenderMCP",
-    "version": (1, 2),
+    "version": (1, 3),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > BlenderMCP",
     "description": "Connect Blender to Claude via MCP",
@@ -197,6 +197,7 @@ class BlenderMCPServer:
         handlers = {
             "get_scene_info": self.get_scene_info,
             "get_object_info": self.get_object_info,
+            "get_viewport_screenshot": self.get_viewport_screenshot,
             "execute_code": self.execute_code,
             "get_polyhaven_status": self.get_polyhaven_status,
             "get_hyper3d_status": self.get_hyper3d_status,
@@ -330,6 +331,27 @@ class BlenderMCPServer:
         
         return obj_info
     
+    def get_viewport_screenshot(self, filepath, max_size=800):
+        """Save a PNG of the first 3D viewport, downscaled so the longest side is <= max_size."""
+        area = next((a for w in bpy.context.window_manager.windows for a in w.screen.areas
+                     if a.type == 'VIEW_3D'), None)
+        if area is None:
+            raise Exception("No 3D viewport found (is Blender running with a UI?)")
+        window = next(w for w in bpy.context.window_manager.windows if area in w.screen.areas[:])
+        with bpy.context.temp_override(window=window, screen=window.screen, area=area):
+            bpy.ops.screen.screenshot_area(filepath=filepath)
+        img = bpy.data.images.load(filepath)
+        width, height = img.size
+        if max(width, height) > max_size:
+            scale = max_size / max(width, height)
+            width, height = int(width * scale), int(height * scale)
+            img.scale(width, height)
+            img.filepath_raw = filepath
+            img.file_format = 'PNG'
+            img.save()
+        bpy.data.images.remove(img)
+        return {"filepath": filepath, "width": width, "height": height}
+
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""
         # This is powerful but potentially dangerous - use with caution
@@ -1080,7 +1102,9 @@ class BlenderMCPServer:
             self,
             text_prompt: str=None,
             images: list[tuple[str, str]]=None,
-            bbox_condition=None
+            bbox_condition=None,
+            tier: str="Sketch",
+            mesh_mode: str="Raw",
         ):
         try:
             if images is None:
@@ -1088,8 +1112,8 @@ class BlenderMCPServer:
             """Call Rodin API, get the job uuid and subscription key"""
             files = [
                 *[("images", (f"{i:04d}{img_suffix}", img)) for i, (img_suffix, img) in enumerate(images)],
-                ("tier", (None, "Sketch")),
-                ("mesh_mode", (None, "Raw")),
+                ("tier", (None, tier or "Sketch")),
+                ("mesh_mode", (None, mesh_mode or "Raw")),
             ]
             if text_prompt:
                 files.append(("prompt", (None, text_prompt)))
@@ -1111,12 +1135,16 @@ class BlenderMCPServer:
             self,
             text_prompt: str=None,
             images: list[tuple[str, str]]=None,
-            bbox_condition=None
+            bbox_condition=None,
+            tier: str="Sketch",
+            mesh_mode: str="Raw",
         ):
         try:
             req_data = {
-                "tier": "Sketch",
+                "tier": tier or "Sketch",
             }
+            if mesh_mode and mesh_mode != "Raw":
+                req_data["mesh_mode"] = mesh_mode
             if images:
                 req_data["input_image_urls"] = images
             if text_prompt:

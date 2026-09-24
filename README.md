@@ -183,6 +183,47 @@ Here are some examples of what you can ask Claude to do:
 
 Hyper3D's free trial key allows you to generate a limited number of models per day. If the daily limit is reached, you can wait for the next day's reset or obtain your own key from hyper3d.ai and fal.ai.
 
+## Game asset pipeline additions (this fork)
+
+Built to drive the Blender -> Godot pipeline in
+[sphilius/game-dev-starter-kit `pipeline3d/`](https://github.com/sphilius/game-dev-starter-kit/tree/main/pipeline3d).
+
+| Tool | What it does |
+| --- | --- |
+| `get_viewport_screenshot(max_size)` | Returns the 3D viewport as an image, so the agent can look at its work |
+| `list_pipeline_scripts(directory)` | Lists the pipeline scripts in `BLENDER_MCP_SCRIPTS_DIR` |
+| `run_script_file(script_path, config)` | Runs a `main(config) -> dict` script from disk inside Blender and returns its JSON report (cleanup, quadruped rig, weight transfer, bake, clip merge, Godot export) |
+| `generate_3d_via_api` / `poll_3d_api_task` / `import_3d_api_result` | Tripo, Meshy or Rodin generation with your own API key, downloaded and imported into the scene |
+| `rig_3d_via_api` | Tripo / Meshy auto-rig of a model generated there |
+| `generate_hyper3d_model_via_*` | Now take `tier` (`Sketch`, `Regular`, `Detail`, `Smooth`, `Gen-2`) and `mesh_mode` (`Raw` or `Quad`) |
+| prompt `game_asset_pipeline` | Stage order and rules for turning generated models into Godot-ready assets |
+
+Fixes: `generate_hyper3d_model_via_images` crashed when given URLs (it validated the wrong
+list); the socket timeout was 15 s, which killed any real cleanup/bake/export, and is now
+180 s (`BLENDER_MCP_TIMEOUT`); request logging no longer prints whole scripts.
+
+Environment variables for the MCP server:
+
+```json
+{
+  "mcpServers": {
+    "blender": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/sphilius/blender-mcp", "blender-mcp"],
+      "env": {
+        "BLENDER_MCP_SCRIPTS_DIR": "C:/Users/<you>/game-dev-starter-kit/pipeline3d/blender",
+        "BLENDER_MCP_TIMEOUT": "300",
+        "TRIPO_API_KEY": "tsk_...",
+        "MESHY_API_KEY": "msy_..."
+      }
+    }
+  }
+}
+```
+
+Also `BLENDER_HOST` / `BLENDER_PORT` if the add-on listens somewhere other than `localhost:9876`.
+Install the updated `addon.py` into Blender as well (the screenshot and Rodin options live there).
+
 ## Troubleshooting
 
 - **Connection issues**: Make sure the Blender addon server is running, and the MCP server is configured on Claude, DO NOT run the uvx command in the terminal. Sometimes, the first command won't go through but after that it starts working.
