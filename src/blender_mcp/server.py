@@ -12,7 +12,6 @@ from pathlib import Path
 import base64
 from urllib.parse import urlparse
 import re
-import tempfile
 
 from . import gen3d
 
@@ -729,16 +728,11 @@ def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
     Parameters:
     - max_size: longest side of the returned image in pixels (default 800)
     """
-    path = os.path.join(tempfile.gettempdir(), f"blender_mcp_shot_{os.getpid()}.png")
-    try:
-        blender = get_blender_connection()
-        blender.send_command("get_viewport_screenshot", {"filepath": path, "max_size": max_size})
-        with open(path, "rb") as fh:
-            data = fh.read()
-        return Image(data=data, format="png")
-    finally:
-        if os.path.exists(path):
-            os.remove(path)
+    # The add-on returns the PNG bytes over the socket, so this also works when Blender runs
+    # on another machine (BLENDER_HOST) with no shared filesystem.
+    blender = get_blender_connection()
+    result = blender.send_command("get_viewport_screenshot", {"max_size": max_size})
+    return Image(data=base64.b64decode(result["image_base64"]), format="png")
 
 
 # ----------------------------------------------------------------------------- pipeline scripts
@@ -827,8 +821,14 @@ def _gen3d_call(args: list[str]) -> dict:
     import io
     from contextlib import redirect_stdout
     buf = io.StringIO()
-    with redirect_stdout(buf):
-        gen3d.main(args)
+    try:
+        with redirect_stdout(buf):
+            gen3d.main(args)
+    except SystemExit as exc:
+        # argparse rejects bad values (e.g. an unknown provider) with SystemExit; report, don't exit
+        return {"ok": False, "error": f"invalid arguments for gen3d ({exc.code}): {' '.join(args[:4])}; "
+                                      f"provider must be one of {sorted(gen3d.PROVIDERS)}, "
+                                      "mode one of text, image, multiview, refine"}
     return json.loads(buf.getvalue() or "{}")
 
 
@@ -925,17 +925,32 @@ def import_3d_api_result(
     After importing, run cleanup_for_godot.py (run_script_file) before rigging.
     """
     folder = os.path.expanduser(download_dir or "~/pipeline3d_downloads")
-    out = os.path.join(folder, f"{name}.glb")
+    out = os.path.join(folder, f"{name}.glb")   # renamed by gen3d if the result is FBX/OBJ/ZIP
     args = ["download", "--provider", provider, "--task", task_id, "--out", out]
     for field in prefer or []:
         args += ["--prefer", field]
     res = _gen3d_call(args)
     if not res.get("ok"):
         return json.dumps(res, indent=2)
+    path = res["out"]
+    importer = {"glb": "bpy.ops.import_scene.gltf", "gltf": "bpy.ops.import_scene.gltf",
+                "fbx": "bpy.ops.import_scene.fbx", "obj": "bpy.ops.wm.obj_import"}.get(res.get("format"))
+    if importer is None:
+        res["blender"] = f"downloaded {path} but .{res.get('format')} can't be imported directly; unpack it first"
+        return json.dumps(res, indent=2)
+    if BLENDER_HOST in ("localhost", "127.0.0.1", "::1"):
+        fetch = f"path = {path!r}\n"
+    else:
+        # Blender is on another machine: let it fetch the same result URL itself.
+        suffix = "." + res["format"]
+        fetch = ("import tempfile, urllib.request\n"
+                 f"path = tempfile.mkstemp(suffix={suffix!r})[1]\n"
+                 f"urllib.request.urlretrieve({res['url']!r}, path)\n")
     code = (
         "import bpy\n"
+        + fetch +
         "before = set(bpy.data.objects)\n"
-        f"bpy.ops.import_scene.gltf(filepath={out!r})\n"
+        f"{importer}(filepath=path)\n"
         "new = [o.name for o in bpy.data.objects if o not in before]\n"
         "print('IMPORTED', new)\n"
     )

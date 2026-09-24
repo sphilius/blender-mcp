@@ -331,8 +331,14 @@ class BlenderMCPServer:
         
         return obj_info
     
-    def get_viewport_screenshot(self, filepath, max_size=800):
-        """Save a PNG of the first 3D viewport, downscaled so the longest side is <= max_size."""
+    def get_viewport_screenshot(self, max_size=800, filepath=None):
+        """PNG of the first 3D viewport (longest side <= max_size), returned base64-encoded.
+        The file is written on the Blender host and the bytes travel over the socket, so the
+        MCP server doesn't need a shared filesystem. Pass filepath to also keep the file."""
+        import base64
+        keep = filepath is not None
+        if not keep:
+            filepath = os.path.join(tempfile.gettempdir(), f"blendermcp_shot_{os.getpid()}.png")
         area = next((a for w in bpy.context.window_manager.windows for a in w.screen.areas
                      if a.type == 'VIEW_3D'), None)
         if area is None:
@@ -350,7 +356,12 @@ class BlenderMCPServer:
             img.file_format = 'PNG'
             img.save()
         bpy.data.images.remove(img)
-        return {"filepath": filepath, "width": width, "height": height}
+        with open(filepath, "rb") as fh:
+            data = base64.b64encode(fh.read()).decode("ascii")
+        if not keep:
+            os.remove(filepath)
+        return {"image_base64": data, "width": width, "height": height,
+                "filepath": filepath if keep else None}
 
     def execute_code(self, code):
         """Execute arbitrary Blender Python code"""
