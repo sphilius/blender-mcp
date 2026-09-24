@@ -11,6 +11,15 @@ import os
 from pathlib import Path
 import base64
 from urllib.parse import urlparse
+import re
+
+from . import gen3d
+
+# Pipeline scripts (decimate, bake, rig, export) can run for minutes; the old 15 s limit
+# killed them mid-way. Override with BLENDER_MCP_TIMEOUT (seconds).
+SOCKET_TIMEOUT = float(os.environ.get("BLENDER_MCP_TIMEOUT", "180"))
+BLENDER_HOST = os.environ.get("BLENDER_HOST", "localhost")
+BLENDER_PORT = int(os.environ.get("BLENDER_PORT", "9876"))
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -52,7 +61,7 @@ class BlenderConnection:
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
         # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(15.0)  # Match the addon's timeout
+        sock.settimeout(SOCKET_TIMEOUT)
         
         try:
             while True:
@@ -116,14 +125,15 @@ class BlenderConnection:
         
         try:
             # Log the command being sent
-            logger.info(f"Sending command: {command_type} with params: {params}")
+            shown = json.dumps(params or {})
+            logger.info(f"Sending command: {command_type} with params: {shown[:300]}{'...' if len(shown) > 300 else ''}")
             
             # Send the command
             self.sock.sendall(json.dumps(command).encode('utf-8'))
             logger.info(f"Command sent, waiting for response...")
             
             # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(15.0)  # Match the addon's timeout
+            self.sock.settimeout(SOCKET_TIMEOUT)
             
             # Receive the response using the improved receive_full_response method
             response_data = self.receive_full_response(self.sock)
@@ -225,7 +235,7 @@ def get_blender_connection():
     
     # Create a new connection if needed
     if _blender_connection is None:
-        _blender_connection = BlenderConnection(host="localhost", port=9876)
+        _blender_connection = BlenderConnection(host=BLENDER_HOST, port=BLENDER_PORT)
         if not _blender_connection.connect():
             logger.error("Failed to connect to Blender")
             _blender_connection = None
@@ -528,7 +538,9 @@ def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | 
 def generate_hyper3d_model_via_text(
     ctx: Context,
     text_prompt: str,
-    bbox_condition: list[float]=None
+    bbox_condition: list[float]=None,
+    tier: str="Sketch",
+    mesh_mode: str="Raw",
 ) -> str:
     """
     Generate 3D asset using Hyper3D by giving description of the desired asset, and import the asset into Blender.
@@ -538,6 +550,8 @@ def generate_hyper3d_model_via_text(
     Parameters:
     - text_prompt: A short description of the desired model in **English**.
     - bbox_condition: Optional. If given, it has to be a list of floats of length 3. Controls the ratio between [Length, Width, Height] of the model.
+    - tier: Rodin tier, e.g. "Sketch" (fast, cheapest, default), "Regular", "Detail", "Smooth", "Gen-2".
+    - mesh_mode: "Raw" (triangles, default) or "Quad" (quad-dominant, better for rigging and cleanup).
 
     Returns a message indicating success or failure.
     """
@@ -547,6 +561,8 @@ def generate_hyper3d_model_via_text(
             "text_prompt": text_prompt,
             "images": None,
             "bbox_condition": _process_bbox(bbox_condition),
+            "tier": tier,
+            "mesh_mode": mesh_mode,
         })
         succeed = result.get("submit_time", False)
         if succeed:
@@ -565,7 +581,9 @@ def generate_hyper3d_model_via_images(
     ctx: Context,
     input_image_paths: list[str]=None,
     input_image_urls: list[str]=None,
-    bbox_condition: list[float]=None
+    bbox_condition: list[float]=None,
+    tier: str="Sketch",
+    mesh_mode: str="Raw",
 ) -> str:
     """
     Generate 3D asset using Hyper3D by giving images of the wanted asset, and import the generated asset into Blender.
@@ -576,6 +594,8 @@ def generate_hyper3d_model_via_images(
     - input_image_paths: The **absolute** paths of input images. Even if only one image is provided, wrap it into a list. Required if Hyper3D Rodin in MAIN_SITE mode.
     - input_image_urls: The URLs of input images. Even if only one image is provided, wrap it into a list. Required if Hyper3D Rodin in FAL_AI mode.
     - bbox_condition: Optional. If given, it has to be a list of ints of length 3. Controls the ratio between [Length, Width, Height] of the model.
+    - tier: Rodin tier, e.g. "Sketch" (default), "Regular", "Detail", "Smooth", "Gen-2".
+    - mesh_mode: "Raw" (triangles, default) or "Quad" (quad-dominant, better for rigging and cleanup).
 
     Only one of {input_image_paths, input_image_urls} should be given at a time, depending on the Hyper3D Rodin's current mode.
     Returns a message indicating success or failure.
@@ -594,7 +614,7 @@ def generate_hyper3d_model_via_images(
                     (Path(path).suffix, base64.b64encode(f.read()).decode("ascii"))
                 )
     elif input_image_urls is not None:
-        if not all(urlparse(i) for i in input_image_paths):
+        if not all(urlparse(i).scheme in ("http", "https") for i in input_image_urls):
             return "Error: not all image URLs are valid!"
         images = input_image_urls.copy()
     try:
@@ -603,6 +623,8 @@ def generate_hyper3d_model_via_images(
             "text_prompt": None,
             "images": images,
             "bbox_condition": _process_bbox(bbox_condition),
+            "tier": tier,
+            "mesh_mode": mesh_mode,
         })
         succeed = result.get("submit_time", False)
         if succeed:
@@ -691,6 +713,281 @@ def import_generated_asset(
     except Exception as e:
         logger.error(f"Error generating Hyper3D task: {str(e)}")
         return f"Error generating Hyper3D task: {str(e)}"
+
+# ----------------------------------------------------------------------------- viewport
+
+@mcp.tool()
+def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
+    """
+    Capture the current Blender 3D viewport as an image so you can see what you built.
+
+    Use it after every visible change (import, cleanup, rig, pose) to check the result
+    instead of guessing from numbers. Needs Blender running with its UI; for headless
+    runs use run_script_file with render_preview.py instead.
+
+    Parameters:
+    - max_size: longest side of the returned image in pixels (default 800)
+    """
+    # The add-on returns the PNG bytes over the socket, so this also works when Blender runs
+    # on another machine (BLENDER_HOST) with no shared filesystem.
+    blender = get_blender_connection()
+    result = blender.send_command("get_viewport_screenshot", {"max_size": max_size})
+    return Image(data=base64.b64decode(result["image_base64"]), format="png")
+
+
+# ----------------------------------------------------------------------------- pipeline scripts
+
+_RESULT_MARKER = "PIPELINE_RESULT "
+
+
+def _scripts_dir() -> str | None:
+    return os.environ.get("BLENDER_MCP_SCRIPTS_DIR")
+
+
+@mcp.tool()
+def list_pipeline_scripts(ctx: Context, directory: str = None) -> str:
+    """
+    List Blender pipeline scripts (cleanup, rigging, baking, export...) available to run_script_file.
+
+    Parameters:
+    - directory: folder to scan. Defaults to the BLENDER_MCP_SCRIPTS_DIR environment variable,
+      e.g. <game-dev-starter-kit>/pipeline3d/blender
+
+    Returns each script's path and the first line of its docstring.
+    """
+    folder = directory or _scripts_dir()
+    if not folder or not os.path.isdir(os.path.expanduser(folder)):
+        return "No scripts folder. Pass directory=... or set BLENDER_MCP_SCRIPTS_DIR in the MCP server config."
+    folder = os.path.expanduser(folder)
+    rows = []
+    for name in sorted(os.listdir(folder)):
+        if not name.endswith(".py") or name.startswith("_"):
+            continue
+        path = os.path.join(folder, name)
+        with open(path, encoding="utf-8") as fh:
+            head = fh.read(2000)
+        doc = re.search(r'"""\s*(.+?)\n', head)
+        rows.append({"script": path, "summary": doc.group(1).strip() if doc else ""})
+    return json.dumps(rows, indent=2)
+
+
+@mcp.tool()
+def run_script_file(ctx: Context, script_path: str, config: dict = None) -> str:
+    """
+    Run a pipeline script from disk inside Blender and return its JSON report.
+
+    The script must define main(config) -> dict (all pipeline3d scripts do). The file is read
+    by the MCP server and executed in the live Blender session, so the scene changes are
+    visible immediately. Only config keys you pass override the script's CONFIG defaults.
+
+    Typical order for an AI-generated asset:
+      cleanup_for_godot.py -> (quadruped_rig.py | Mixamo) -> merge_clips.py -> export_for_godot.py
+    Also: build_karambit.py, transfer_weights.py, udim_to_01.py, bake_diffuse.py, render_preview.py
+
+    Parameters:
+    - script_path: absolute path, or a file name inside BLENDER_MCP_SCRIPTS_DIR
+    - config: dict of CONFIG overrides, e.g. {"import_path": "~/in.glb", "target_tris": 12000}
+    """
+    path = os.path.expanduser(script_path)
+    if not os.path.isabs(path) and _scripts_dir():
+        path = os.path.join(os.path.expanduser(_scripts_dir()), path)
+    if not os.path.exists(path):
+        return f"Error: script not found: {path}"
+    with open(path, encoding="utf-8") as fh:
+        source = fh.read()
+    cfg_literal = json.dumps(json.dumps(config or {}))
+    code = (f"{source}\n\n"
+            f"import json as _pipeline_json\n"
+            f"_pipeline_result = main(_pipeline_json.loads({cfg_literal}))\n"
+            f"print({_RESULT_MARKER!r} + _pipeline_json.dumps(_pipeline_result, default=str))\n")
+    try:
+        blender = get_blender_connection()
+        result = blender.send_command("execute_code", {"code": code})
+        output = result.get("result", "") if isinstance(result, dict) else str(result)
+        marker = output.rfind(_RESULT_MARKER)
+        if marker == -1:
+            return f"Script ran but returned no report. Output:\n{output[-3000:]}"
+        log = output[:marker].strip()
+        report = output[marker + len(_RESULT_MARKER):].strip()
+        return report if not log else f"{report}\n\n--- log ---\n{log[-2000:]}"
+    except Exception as e:
+        logger.error(f"Error running script {path}: {str(e)}")
+        return f"Error running script {path}: {str(e)}"
+
+
+# ----------------------------------------------------------------------------- cloud generation APIs
+
+def _gen3d_call(args: list[str]) -> dict:
+    import io
+    from contextlib import redirect_stdout
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            gen3d.main(args)
+    except SystemExit as exc:
+        # argparse rejects bad values (e.g. an unknown provider) with SystemExit; report, don't exit
+        return {"ok": False, "error": f"invalid arguments for gen3d ({exc.code}): {' '.join(args[:4])}; "
+                                      f"provider must be one of {sorted(gen3d.PROVIDERS)}, "
+                                      "mode one of text, image, multiview, refine"}
+    return json.loads(buf.getvalue() or "{}")
+
+
+@mcp.tool()
+def generate_3d_via_api(
+    ctx: Context,
+    provider: str,
+    mode: str = "image",
+    prompt: str = None,
+    image_paths: list[str] = None,
+    options: dict = None,
+) -> str:
+    """
+    Start a cloud 3D generation job on Tripo or Meshy (or Rodin with your own key).
+    Non-blocking: returns a task id. Then call poll_3d_api_task, then import_3d_api_result.
+
+    Keys come from the MCP server's environment: TRIPO_API_KEY, MESHY_API_KEY, RODIN_API_KEY.
+    (Rodin via the Blender addon's free-trial key: use generate_hyper3d_model_via_* instead.)
+
+    Parameters:
+    - provider: "tripo" | "meshy" | "rodin"
+    - mode: "text" | "image" | "multiview" (multiview images in order front, left, back, right)
+    - prompt: text prompt (text mode)
+    - image_paths: absolute paths to reference images (image / multiview mode)
+    - options: provider request fields passed through unchanged, e.g.
+        tripo: {"face_limit": 15000, "quad": true, "texture": false}
+        meshy: {"topology": "quad", "target_polycount": 15000, "should_remesh": true}
+        rodin: {"tier": "Gen-2", "mesh_mode": "Quad"}
+
+    Game-asset rules: generate a neutral A-pose, flat-lit, weapon-free body; generate armour,
+    clothing and props as separate parts; ask for quads and a face budget up front.
+    """
+    args = ["create", "--provider", provider, "--mode", mode]
+    if prompt:
+        args += ["--prompt", prompt]
+    for path in image_paths or []:
+        args += ["--image", os.path.expanduser(path)]
+    for k, v in (options or {}).items():
+        args += ["--opt", f"{k}={json.dumps(v)}"]
+    return json.dumps(_gen3d_call(args), indent=2)
+
+
+@mcp.tool()
+def poll_3d_api_task(ctx: Context, provider: str, task_id: str) -> str:
+    """
+    Check a Tripo / Meshy / Rodin task started with generate_3d_via_api or rig_3d_via_api.
+    Poll every ~10 s until state is success / SUCCEEDED / Done, then call import_3d_api_result.
+
+    Parameters:
+    - provider: "tripo" | "meshy" | "rodin"
+    - task_id: the "task" value returned when the job was created
+    """
+    return json.dumps(_gen3d_call(["status", "--provider", provider, "--task", task_id]), indent=2)
+
+
+@mcp.tool()
+def rig_3d_via_api(ctx: Context, provider: str, task_id: str, options: dict = None) -> str:
+    """
+    Auto-rig a model generated on Tripo or Meshy (humanoids; Tripo also offers other rig types).
+    Non-blocking: returns a new task id to poll, then import with import_3d_api_result.
+    For quadrupeds without API support, run quadruped_rig.py with run_script_file instead.
+
+    Parameters:
+    - provider: "tripo" | "meshy"
+    - task_id: the finished generation task id
+    - options: provider fields, e.g. meshy {"height_meters": 1.78}
+    """
+    try:
+        p = gen3d.PROVIDERS[provider]()
+        return json.dumps({"ok": True, "provider": provider, "task": p.rig(task_id, options or {})})
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)})
+
+
+@mcp.tool()
+def import_3d_api_result(
+    ctx: Context,
+    provider: str,
+    task_id: str,
+    name: str,
+    download_dir: str = None,
+    prefer: list[str] = None,
+) -> str:
+    """
+    Download a finished Tripo / Meshy / Rodin result and import it into the Blender scene.
+
+    Parameters:
+    - provider: "tripo" | "meshy" | "rodin"
+    - task_id: finished task id
+    - name: file / object name to use (e.g. "character_raw")
+    - download_dir: where to keep the file (default: ~/pipeline3d_downloads)
+    - prefer: result fields to prefer, e.g. ["pbr_model"] or ["model"] (Tripo), ["fbx"]
+
+    After importing, run cleanup_for_godot.py (run_script_file) before rigging.
+    """
+    folder = os.path.expanduser(download_dir or "~/pipeline3d_downloads")
+    out = os.path.join(folder, f"{name}.glb")   # renamed by gen3d if the result is FBX/OBJ/ZIP
+    args = ["download", "--provider", provider, "--task", task_id, "--out", out]
+    for field in prefer or []:
+        args += ["--prefer", field]
+    res = _gen3d_call(args)
+    if not res.get("ok"):
+        return json.dumps(res, indent=2)
+    path = res["out"]
+    importer = {"glb": "bpy.ops.import_scene.gltf", "gltf": "bpy.ops.import_scene.gltf",
+                "fbx": "bpy.ops.import_scene.fbx", "obj": "bpy.ops.wm.obj_import"}.get(res.get("format"))
+    if importer is None:
+        res["blender"] = f"downloaded {path} but .{res.get('format')} can't be imported directly; unpack it first"
+        return json.dumps(res, indent=2)
+    if BLENDER_HOST in ("localhost", "127.0.0.1", "::1"):
+        fetch = f"path = {path!r}\n"
+    else:
+        # Blender is on another machine: let it fetch the same result URL itself.
+        suffix = "." + res["format"]
+        fetch = ("import tempfile, urllib.request\n"
+                 f"path = tempfile.mkstemp(suffix={suffix!r})[1]\n"
+                 f"urllib.request.urlretrieve({res['url']!r}, path)\n")
+    code = (
+        "import bpy\n"
+        + fetch +
+        "before = set(bpy.data.objects)\n"
+        f"{importer}(filepath=path)\n"
+        "new = [o.name for o in bpy.data.objects if o not in before]\n"
+        "print('IMPORTED', new)\n"
+    )
+    try:
+        imported = get_blender_connection().send_command("execute_code", {"code": code})
+        res["blender"] = imported.get("result", "") if isinstance(imported, dict) else str(imported)
+    except Exception as e:
+        res["blender"] = f"downloaded but not imported: {e}"
+    return json.dumps(res, indent=2)
+
+
+@mcp.prompt()
+def game_asset_pipeline() -> str:
+    """Stage order and rules for turning generated 3D models into Godot-ready game assets"""
+    return """You are running a Blender -> Godot game asset pipeline. Work in stages and check each one.
+
+    0. get_scene_info(); list_pipeline_scripts() to find cleanup / rig / export scripts.
+    1. GENERATE one part at a time: body (neutral A-pose, flat lighting, no weapon), then clothing,
+       armour and props separately. Prefer quads and a face budget (10-25k for characters).
+       Tools: generate_3d_via_api (tripo, meshy), generate_hyper3d_model_via_* (Rodin trial key),
+       PolyHaven for environment assets. Hard-surface props with exact features (rings, holes,
+       pivots) are better built procedurally (e.g. build_karambit.py) than generated.
+    2. CLEAN before rigging: run_script_file("cleanup_for_godot.py", {...}) - join, weld, fill holes,
+       drop floaters, decimate to budget, scale to real height, origin at the feet.
+       Read the report: tris, dimensions_m, pieces, non_manifold_edges, uv.
+    3. LOOK: get_viewport_screenshot() after every visible change. Numbers can pass while the
+       mesh is wrong (fused arms, missing hands).
+    4. RIG: humanoids -> Mixamo / AccuRIG (manual web/desktop step: tell the user exactly what to
+       upload and where to save) or rig_3d_via_api. Quadrupeds -> quadruped_rig.py (31 bones,
+       idle/walk/attack/death at 30 fps, in place). Clothing -> transfer_weights.py from the body.
+    5. ANIMATE: merge_clips.py for Mixamo / ActorCore / mocap files (one skeleton, one clip per file,
+       In Place for locomotion). Keep clips in place: the game controller moves the character.
+    6. EXPORT: export_for_godot.py -> .glb, +Y up, one animation per NLA track; collision
+       "convex" for props. Godot's pipeline_import plugin sets loop modes by clip name.
+    Never apply transforms or join meshes on an already-skinned character (it breaks the skin).
+    Normal maps: Blender and Godot are OpenGL (Y+); only flip green for Unreal.
+    """
 
 @mcp.prompt()
 def asset_creation_strategy() -> str:
